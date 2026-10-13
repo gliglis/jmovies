@@ -26,6 +26,7 @@ tmdb_api_key entry in config.txt located next to the script.
 """
 
 import argparse
+import datetime
 import logging
 import os
 import re
@@ -257,64 +258,54 @@ def resolve_movie(tmdb, query, tmdbid_known, hint_year):
 
 # --------------------------- logging ---------------------------
 
-def setup_logging(log_path):
+LOG_FMT = logging.Formatter('%(asctime)s  %(levelname)s  %(message)s', '%Y-%m-%d %H:%M:%S')
+
+
+def setup_console():
     log.setLevel(logging.INFO)
     log.handlers.clear()
-    fmt = logging.Formatter('%(asctime)s  %(levelname)s  %(message)s', '%Y-%m-%d %H:%M:%S')
     ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(fmt)
+    ch.setFormatter(LOG_FMT)
     log.addHandler(ch)
-    if log_path:
-        try:
-            fh = logging.FileHandler(log_path, encoding='utf-8')
-            fh.setFormatter(fmt)
-            log.addHandler(fh)
-        except OSError as exc:
-            log.warning('Could not open log file (%s): %s', log_path, exc)
+
+
+def slug(text):
+    """Filesystem-safe fragment from a path's basename, for the log file name."""
+    s = re.sub(r'[^\w.-]+', '_', text.strip('/').split('/')[-1] or 'root')
+    return s.strip('_') or 'root'
+
+
+def add_file_handler(log_dir, name):
+    """Attach a file handler <log_dir>/<name>; return it (or None on failure)."""
+    if not log_dir:
+        return None
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        fh = logging.FileHandler(os.path.join(log_dir, name), encoding='utf-8')
+        fh.setFormatter(LOG_FMT)
+        log.addHandler(fh)
+        return fh
+    except OSError as exc:
+        log.warning('Could not open log file (%s): %s', os.path.join(log_dir, name), exc)
+        return None
+
+
+def drop_handler(fh):
+    if fh:
+        log.removeHandler(fh)
+        fh.close()
 
 
 # --------------------------- main flow ---------------------------
 
-def main():
-    ap = argparse.ArgumentParser(
-        description='Add TMDB identifiers to movie file names (local, in place).')
-    ap.add_argument('--dir', '--path', dest='path', default=None,
-                    help='movie library directory (required unless path= is set in config.txt)')
-    ap.add_argument('--config', default=os.path.join(SCRIPT_DIR, 'config.txt'))
-    ap.add_argument('--apply', action='store_true', help='execute changes (preview by default)')
-    ap.add_argument('--dry-run', action='store_true', help='force preview')
-    ap.add_argument('--api-key', default=None)
-    ap.add_argument('--language', default=None)
-    ap.add_argument('--log', default=None, help='log file path (default: jmovies.log)')
-    ap.add_argument('--no-log', action='store_true', help='do not write a log file')
-    args = ap.parse_args()
+class Stats:
+    def __init__(self):
+        self.renamed = self.skipped_tagged = self.duplicates = 0
+        self.unresolved = self.errors = 0
 
-    cfg = read_config(args.config)
 
-    root = (args.path or cfg.get('path') or '').rstrip('/')
-    api_key = args.api_key or os.environ.get('TMDB_API_KEY') or cfg.get('tmdb_api_key')
-    language = args.language or cfg.get('tmdb_language') or 'en-US'
-    apply = args.apply or cfg.get('mode', 'preview').lower().startswith('apply')
-    if args.dry_run:
-        apply = False
-    log_path = None if args.no_log else (args.log or cfg.get('log_path')
-                                         or os.path.join(SCRIPT_DIR, 'jmovies.log'))
-
-    setup_logging(log_path)
-
-    if not root:
-        log.error('No library directory. Pass --dir /path (or set path= in config.txt).')
-        sys.exit(1)
-    if not os.path.isdir(root):
-        log.error('Directory does not exist: %s', root)
-        sys.exit(1)
-    if not api_key or api_key.startswith('PUT_YOUR'):
-        log.error('No TMDB key (--api-key / TMDB_API_KEY / tmdb_api_key in config.txt).')
-        sys.exit(1)
-
-    tmdb = Tmdb(api_key, language)
-
-    # Collect video files (skipping Synology's @eaDir)
+def process_root(root, tmdb, apply, stats):
+    """Rename movie files under one library root, in place."""
     video_files = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d != '@eaDir']
@@ -323,12 +314,9 @@ def main():
                 video_files.append(os.path.join(dirpath, f))
     video_files.sort()
 
-    log.info('==== START ==== library: %s', root)
-    log.info('Mode: %s', 'APPLY' if apply else 'PREVIEW (no changes, add --apply)')
-    log.info('Video files found: %d', len(video_files))
-
-    renamed = skipped_tagged = duplicates = unresolved = errors = 0
-    claimed = set()  # target names taken during this run (collision protection)
+    log.info('---- path: %s  (%d video files) ----', root, len(video_files))
+    total = len(video_files)
+    claimed = set()  # target names taken under this root (collision protection)
 
     for idx, src in enumerate(video_files, 1):
         base = os.path.basename(src)
@@ -336,7 +324,7 @@ def main():
 
         # Files that already carry an identifier in their own name — skip.
         if RE_TMDBID.search(base):
-            skipped_tagged += 1
+            stats.skipped_tagged += 1
             continue
 
         # Hints from the file name and (optionally) from the parent folder.
@@ -352,9 +340,8 @@ def main():
 
         res = resolve_movie(tmdb, query, tmdbid_known, hint_year)
         if not res.get('ok'):
-            unresolved += 1
-            log.warning('[%d/%d] NO MATCH: %s — %s',
-                        idx, len(video_files), base, res.get('reason', '?'))
+            stats.unresolved += 1
+            log.warning('[%d/%d] NO MATCH: %s — %s', idx, total, base, res.get('reason', '?'))
             continue
 
         name, yr, tid = res['name'], res['year'], res['id']
@@ -365,7 +352,7 @@ def main():
         dest = os.path.join(dirn, new_base)
 
         if dest == src:
-            skipped_tagged += 1
+            stats.skipped_tagged += 1
             continue
 
         # Name collision (same target already exists or was claimed this run):
@@ -379,31 +366,96 @@ def main():
                     dest, new_base = cand, os.path.basename(cand)
                     break
                 dup_n += 1
-            duplicates += 1
+            stats.duplicates += 1
             log.warning('[%d/%d] DUPLICATE: "%s" — name taken, assigning "%s"',
-                        idx, len(video_files), base, new_base)
+                        idx, total, base, new_base)
 
         claimed.add(dest)
         if apply:
             try:
                 os.rename(src, dest)
-                renamed += 1
-                log.info('[%d/%d] OK: %s  ->  %s', idx, len(video_files), base, new_base)
+                stats.renamed += 1
+                log.info('[%d/%d] OK: %s  ->  %s', idx, total, base, new_base)
             except OSError as exc:
-                errors += 1
-                log.error('[%d/%d] RENAME ERROR "%s": %s',
-                          idx, len(video_files), base, exc)
+                stats.errors += 1
+                log.error('[%d/%d] RENAME ERROR "%s": %s', idx, total, base, exc)
         else:
-            renamed += 1
-            log.info('[%d/%d] RENAME: %s  ->  %s', idx, len(video_files), base, new_base)
+            stats.renamed += 1
+            log.info('[%d/%d] RENAME: %s  ->  %s', idx, total, base, new_base)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description='Add TMDB identifiers to movie file names (local, in place).')
+    ap.add_argument('paths', nargs='*', help='movie library directory/directories (positional)')
+    ap.add_argument('--dir', '--path', dest='dirs', action='append', default=[], metavar='DIR',
+                    help='movie library directory; repeat for several (e.g. --dir A --dir B)')
+    ap.add_argument('--config', default=os.path.join(SCRIPT_DIR, 'config.txt'))
+    ap.add_argument('--apply', action='store_true', help='execute changes (preview by default)')
+    ap.add_argument('--dry-run', action='store_true', help='force preview')
+    ap.add_argument('--api-key', default=None)
+    ap.add_argument('--language', default=None)
+    ap.add_argument('--log-dir', default=None,
+                    help='directory for dated log files (default: next to the script)')
+    ap.add_argument('--no-log', action='store_true', help='do not write log files')
+    args = ap.parse_args()
+
+    cfg = read_config(args.config)
+
+    given = args.dirs + args.paths or ([cfg['path']] if cfg.get('path') else [])
+    api_key = args.api_key or os.environ.get('TMDB_API_KEY') or cfg.get('tmdb_api_key')
+    language = args.language or cfg.get('tmdb_language') or 'en-US'
+    apply = args.apply or cfg.get('mode', 'preview').lower().startswith('apply')
+    if args.dry_run:
+        apply = False
+    log_dir = None if args.no_log else (args.log_dir or cfg.get('log_dir') or SCRIPT_DIR)
+    datestr = datetime.date.today().isoformat()
+
+    setup_console()
+    main_log = add_file_handler(log_dir, f'jmovies-{datestr}.log')
+
+    if not given:
+        log.error('No library directory. Pass --dir /path (or set path= in config.txt).')
+        sys.exit(1)
+    if not api_key or api_key.startswith('PUT_YOUR'):
+        log.error('No TMDB key (--api-key / TMDB_API_KEY / tmdb_api_key in config.txt).')
+        sys.exit(1)
+
+    # Keep existing directories only; drop duplicates / repeats by realpath.
+    seen, roots = set(), []
+    for p in given:
+        rp = os.path.realpath(p.rstrip('/'))
+        if not os.path.isdir(rp):
+            log.error('Not a directory, skipping: %s', p)
+            continue
+        if rp not in seen:
+            seen.add(rp)
+            roots.append(rp)
+    if not roots:
+        log.error('None of the given paths is a directory.')
+        sys.exit(1)
+
+    tmdb = Tmdb(api_key, language)
+    stats = Stats()
+
+    log.info('==== START ==== libraries: %s', ', '.join(roots))
+    log.info('Mode: %s', 'APPLY' if apply else 'PREVIEW (no changes, add --apply)')
+
+    # Each path is processed separately and also gets its own dated log file.
+    for root in roots:
+        path_log = add_file_handler(log_dir, f'jmovies-{slug(root)}-{datestr}.log')
+        process_root(root, tmdb, apply, stats)
+        drop_handler(path_log)
 
     log.info('==== DONE ====')
     verb = 'Renamed' if apply else 'To rename'
     log.info('%s: %d (incl. suffixed duplicates: %d) | skipped (already have id): %d | '
              'no match: %d | errors: %d',
-             verb, renamed, duplicates, skipped_tagged, unresolved, errors)
+             verb, stats.renamed, stats.duplicates, stats.skipped_tagged,
+             stats.unresolved, stats.errors)
     if not apply:
         log.info('This was a PREVIEW — add --apply to execute changes.')
+    drop_handler(main_log)
 
 
 if __name__ == '__main__':
