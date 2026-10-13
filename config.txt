@@ -1,12 +1,12 @@
-# Konfiguracja (zapis: klucz=wartość). Program działa LOKALNIE — bez SSH.
+# Configuration (key=value). Runs locally on the NAS — no SSH.
 
-# --- TMDB (wymagane) ---
+# --- TMDB (required) ---
 tmdb_api_key=
 tmdb_language=en-US
 
-# tryb=podglad (domyślnie) albo tryb=wykonaj.
-# Flaga --apply w linii poleceń ma pierwszeństwo nad tym ustawieniem.
-tryb=podglad
+# mode=preview (default) or mode=apply.
+# The --apply command-line flag takes precedence over this setting.
+mode=preview
 
-# Opcjonalnie: katalog-biblioteka (zamiast podawania --dir przy uruchomieniu).
-# path=/volume1/video/Filmy
+# Optional: library directory (instead of passing --dir on the command line).
+# path=/volume1/video/Movies
