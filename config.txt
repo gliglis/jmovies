@@ -1,20 +1,12 @@
-# Konfiguracja porządkowania (zapis: klucz=wartość).
+# Konfiguracja (zapis: klucz=wartość). Program działa LOKALNIE — bez SSH.
 
-# --- Logowanie do NAS (SSH) ---
-host=
-port=
-user=
-password=
-
-# Katalog-BIBLIOTEKA, który zawiera FOLDERY seriali (nie pojedynczy serial).
-# To tutaj powstaną/zostaną uporządkowane foldery "Nazwa (ROK) [tmdbid-ID]".
-path=/volume1/video/TV/Filmy
-
-# --- TMDB ---
+# --- TMDB (wymagane) ---
 tmdb_api_key=
-
 tmdb_language=en-US
 
 # tryb=podglad (domyślnie) albo tryb=wykonaj.
 # Flaga --apply w linii poleceń ma pierwszeństwo nad tym ustawieniem.
 tryb=podglad
+
+# Opcjonalnie: katalog-biblioteka (zamiast podawania --dir przy uruchomieniu).
+# path=/volume1/video/Filmy

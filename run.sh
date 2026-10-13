@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# uruchom_jellyfin.sh — przygotowuje środowisko i uruchamia program.
-# Domyślnie PODGLĄD. Aby wykonać zmiany:   ./uruchom_jellyfin.sh --apply
-# Argumenty są przekazywane dalej (np. --cleanup-empty, --language pl-PL).
+# run.sh — przygotowuje środowisko i uruchamia program LOKALNIE (bez SSH).
+# Domyślnie PODGLĄD. Aby wykonać zmiany:   ./run.sh --dir /volume1/video/Filmy --apply
+# Argumenty są przekazywane dalej do organize.py.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -13,6 +13,6 @@ fi
 
 source .venv/bin/activate
 pip install --quiet --upgrade pip
-pip install --quiet paramiko requests
+pip install --quiet requests
 
-python jmovies.py --config organize.txt "$@"
+python organize.py "$@"
