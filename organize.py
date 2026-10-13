@@ -1,25 +1,34 @@
 #!/usr/bin/env python3
 """
-filmy_porzadkuj.py
+organize.py
 
-Porządkuje bibliotekę FILMÓW dokumentalnych (jednorazowych produkcji) pod Jellyfin,
-operując na NAS-ie po SSH (find + mkdir -p + mv; bez SFTP). Dopasowania TMDB (filmy)
-liczone są lokalnie.
+Porządkuje bibliotekę FILMÓW pod Jellyfin/Plex — działa LOKALNIE na serwerze
+(np. jako zadanie w Harmonogramie zadań Synology). Bez SSH. Dopasowania TMDB
+liczone lokalnie.
 
-Docelowa struktura (film = osobny folder, plik nazwany jak folder):
-  Nazwa filmu (ROK) [tmdbid-XXXXX]/
-    Nazwa filmu (ROK) [tmdbid-XXXXX].PL.1080i.HDTV.H264-B89.ts
+Co robi (jedna sekwencja, "komplet"):
+  1) MAPOWANIE  — plikom BEZ identyfikatora dodaje [tmdbid-XXXXX] w nazwie.
+                  Pliki, które identyfikator już mają, są POMIJANE (nieruszane).
+  2) DEDUPLIKACJA — gdy pod tą samą nazwą docelową jest kilka plików, zostaje
+                  największy, reszta jest usuwana.
+  3) SPRZĄTANIE — usuwa .vsmeta i puste katalogi.
 
-Filmy wieloczęściowe (CZ1/CZ2, Part 2, CD2) trafiają do JEDNEGO folderu jako:
-    Nazwa filmu (ROK) [tmdbid-XXXXX] - part1.<release>.ext
-    Nazwa filmu (ROK) [tmdbid-XXXXX] - part2.<release>.ext
+Docelowa nazwa (płasko — plik zostaje bez dodatkowego folderu):
+  Nazwa filmu (ROK) [tmdbid-XXXXX].PL.1080i.HDTV.H264-B89.ts
+Filmy wieloczęściowe (CZ1/CZ2, Part 2, CD2):
+  Nazwa filmu (ROK) [tmdbid-XXXXX] - part1.<release>.ext
 
-Program NIE modyfikuje zawartości plików — tylko mkdir / mv (oraz kasowanie śmieci).
-Domyślnie PODGLĄD. Faktyczne zmiany: flaga --apply.
+Program NIE tworzy kopii i NIE zakłada folderów — tylko zmiana nazwy/przeniesienie
+(+ kasowanie śmieci). Domyślnie PODGLĄD. Faktyczne zmiany: flaga --apply.
 
-Tryby dodatkowe:
-  --cleanup-only   usuń .vsmeta i puste katalogi (bez TMDB i przenoszenia)
-  --dedupe-only    usuń duplikaty tego samego filmu/części (zostaje największy plik)
+Uruchomienie:
+  python3 organize.py --dir /volume1/video/Filmy            # podgląd
+  python3 organize.py --dir /volume1/video/Filmy --apply    # wykonanie
+
+Klucz TMDB: flaga --api-key, zmienna TMDB_API_KEY albo wpis tmdb_api_key w config.txt
+(szukanym obok skryptu). Cache TMDB gromadzi i pozycje nowo rozpoznane, i te
+odczytane wprost z nazw plików już posiadających identyfikator — dzięki temu
+kolejne uruchomienia nie odpytują TMDB o to, co już znane.
 """
 
 import argparse
@@ -27,21 +36,19 @@ import datetime
 import json
 import os
 import re
-import shlex
+import shutil
 import sys
 import unicodedata
 
 try:
-    import paramiko
-except ImportError:
-    print('Brak biblioteki paramiko. Uruchom przez ./uruchom_filmy.sh', file=sys.stderr)
-    sys.exit(1)
-try:
     import requests
 except ImportError:
-    print('Brak biblioteki requests. Uruchom przez ./uruchom_filmy.sh', file=sys.stderr)
+    print('Brak biblioteki requests. Zainstaluj: pip3 install requests (lub uruchom ./run.sh)',
+          file=sys.stderr)
     sys.exit(1)
 
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 VIDEO_EXT = {'.ts', '.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.mpg', '.mpeg', '.m2ts'}
 
@@ -59,15 +66,6 @@ _RELEASE = (r'(?:PL|ENG|EN|MULTi|LEKTOR|NAPISY|NAPiSY|DUB|SUB|2160p|1080p|1080i|
             r'H\.265|DDP?5\.1|DD\+|E?AC-?3|AAC(?:2\.0)?|DTS(?:-HD)?(?:\.MA)?|TrueHD|Atmos|'
             r'FLAC|MA|5\.1|2\.0|B89|MR)')
 RE_RELEASE_TOKEN = re.compile(r'(?<![A-Za-z0-9])' + _RELEASE + r'(?![A-Za-z0-9])', re.IGNORECASE)
-
-RELEASE_WORDS = {
-    'pl', 'eng', 'en', 'multi', 'lektor', 'napisy', 'dub', 'sub', 'uhd', 'uhdtv',
-    'hdtv', 'hdr', 'hdr10', 'dv', 'sdr', 'web', 'webrip', 'webdl', 'dl', 'bluray',
-    'bdrip', 'brrip', 'dvdrip', 'hdrip', 'remux', 'hevc', 'avc', 'truehd', 'atmos',
-    'flac', 'aac', 'dts', 'ddp', 'ac', 'eac', 'proper', 'repack', 'internal',
-    'extended', 'remastered', 'uncut', 'hybrid', 'imax', 'dual', 'dubbed', 'subbed',
-    'ma', 'mr', 'hd', 'sd',
-}
 
 
 # --------------------------- konfiguracja / pliki ---------------------------
@@ -212,15 +210,6 @@ def human(n):
             return f'{int(n)} {unit}' if unit == 'B' else f'{n:.1f} {unit}'
         n /= 1024
     return f'{n:.1f} TB'
-
-
-def looks_like_title(tail):
-    if not tail:
-        return False
-    for t in re.split(r'[.\s_\-]+', tail):
-        if t and re.fullmatch(r'[^\W\d_]{3,}', t) and normalize(t) not in RELEASE_WORDS:
-            return True
-    return False
 
 
 def parse_movie(base):
@@ -383,79 +372,92 @@ def resolve_movie(tmdb, query, tmdbid_known, hint_year, cache, overrides):
     return res
 
 
-# --------------------------- sprzątanie ---------------------------
+# --------------------------- operacje na plikach (lokalnie) ---------------------------
 
-def build_cleanup_lines(root, keep_vsmeta=False):
-    qroot = shlex.quote(root)
-    junk = r'@eaDir|\.?DS_Store|\._.*|Thumbs\.db|@SynoResource|\.@__thumb|desktop\.ini'
-    lines = []
+def list_files_with_sizes(root):
+    """Zwraca {ścieżka: rozmiar} dla wszystkich plików pod root (pomija @eaDir)."""
+    sizes = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != '@eaDir']
+        for f in filenames:
+            full = os.path.join(dirpath, f)
+            try:
+                sizes[full] = os.path.getsize(full)
+            except OSError:
+                sizes[full] = 0
+    return sizes
+
+
+def _junk_re(keep_vsmeta):
+    pat = r'@eaDir|\.?DS_Store|\._.*|Thumbs\.db|@SynoResource|\.@__thumb|desktop\.ini'
     if not keep_vsmeta:
-        junk += r'|.*\.vsmeta'
-        lines += [
-            f"VSN=$(find {qroot} -type f -name '*.vsmeta' 2>/dev/null | wc -l)",
-            f"find {qroot} -type f -name '*.vsmeta' -exec rm -f -- {{}} + 2>/dev/null",
-            "printf 'USUNIETO VSMETA: %s\\n' \"$VSN\"",
-        ]
-    lines += [
-        f"JUNK={shlex.quote(junk)}",
-        f"find {qroot} -depth -type d 2>/dev/null | while IFS= read -r d; do",
-        f"  [ \"$d\" = {qroot} ] && continue",
-        "  case \"$d\" in */@eaDir|*/@eaDir/*) continue;; esac",
-        "  if [ -z \"$(ls -A \"$d\" 2>/dev/null | grep -vxE \"$JUNK\")\" ]; then",
-        "    rm -rf -- \"$d\" 2>/dev/null && printf 'USUNIETO KATALOG: %s\\n' \"$d\"",
-        "  fi",
-        "done",
-    ]
-    return lines
+        pat += r'|.*\.vsmeta'
+    return re.compile(pat, re.IGNORECASE)
 
 
-# --------------------------- SSH ---------------------------
+def remove_vsmeta(root):
+    """Usuwa pliki *.vsmeta. Zwraca liczbę usuniętych."""
+    n = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != '@eaDir']
+        for f in filenames:
+            if f.lower().endswith('.vsmeta'):
+                try:
+                    os.remove(os.path.join(dirpath, f))
+                    n += 1
+                except OSError:
+                    pass
+    return n
 
-def ssh_run(client, command, stdin_data=None):
-    sin, sout, serr = client.exec_command(command)
-    if stdin_data is not None:
-        sin.write(stdin_data)
-        sin.channel.shutdown_write()
-    out = sout.read().decode('utf-8', 'replace')
-    err = serr.read().decode('utf-8', 'replace')
-    code = sout.channel.recv_exit_status()
-    return code, out, err
+
+def remove_empty_dirs(root, keep_vsmeta):
+    """Usuwa katalogi zawierające wyłącznie śmieci (lub puste). Zwraca liczbę usuniętych."""
+    junk = _junk_re(keep_vsmeta)
+    root = os.path.abspath(root)
+    removed = 0
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        ad = os.path.abspath(dirpath)
+        if ad == root or '@eaDir' in ad.split(os.sep):
+            continue
+        try:
+            entries = os.listdir(dirpath)
+        except OSError:
+            continue
+        if all(junk.fullmatch(e) for e in entries):
+            try:
+                shutil.rmtree(dirpath)
+                removed += 1
+            except OSError:
+                pass
+    return removed
 
 
-def connect(cfg):
-    print(f"Łączę: {cfg['user']}@{cfg['host']}:{cfg.get('port', '22')}")
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+def move_file(src, dest):
+    """Przenosi/zmienia nazwę; obsługuje też inny system plików. Zwraca True przy sukcesie."""
     try:
-        client.connect(cfg['host'], port=int(cfg.get('port', '22')),
-                       username=cfg['user'], password=cfg['password'],
-                       look_for_keys=False, allow_agent=False, timeout=20)
-    except Exception as exc:  # noqa: BLE001
-        print(f'Nie udało się połączyć: {exc}', file=sys.stderr)
-        sys.exit(1)
-    return client
+        os.rename(src, dest)
+    except OSError:
+        shutil.move(src, dest)
+    return True
 
 
 # --------------------------- główny przebieg ---------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description='Porządkowanie FILMÓW pod Jellyfin (SSH + TMDB).')
-    ap.add_argument('--config', default='konfiguracja_filmy.txt')
-    ap.add_argument('--overrides', default='tmdb_overrides_filmy.txt')
-    ap.add_argument('--apply', action='store_true')
-    ap.add_argument('--dry-run', action='store_true')
+    ap = argparse.ArgumentParser(
+        description='Porządkowanie FILMÓW pod Jellyfin (lokalnie + TMDB): '
+                    'dodanie [tmdbid] do nienazwanych plików, deduplikacja, sprzątanie.')
+    ap.add_argument('--dir', '--path', dest='path', default=None,
+                    help='katalog-biblioteka z filmami (wymagane, chyba że podane w config.txt)')
+    ap.add_argument('--config', default=os.path.join(SCRIPT_DIR, 'config.txt'))
+    ap.add_argument('--overrides', default=os.path.join(SCRIPT_DIR, 'tmdb_overrides.txt'))
+    ap.add_argument('--apply', action='store_true', help='wykonaj zmiany (domyślnie podgląd)')
+    ap.add_argument('--dry-run', action='store_true', help='wymuś podgląd')
     ap.add_argument('--api-key', default=None)
     ap.add_argument('--language', default=None)
-    ap.add_argument('--path', default=None)
-    ap.add_argument('--no-cleanup-empty', action='store_true')
-    ap.add_argument('--cleanup-only', action='store_true',
-                    help='tylko usuń .vsmeta i puste katalogi (bez TMDB i przenoszenia)')
-    ap.add_argument('--keep-vsmeta', action='store_true')
-    ap.add_argument('--dedupe-only', action='store_true',
-                    help='usuń duplikaty tego samego filmu/części (zostaje największy plik)')
-    ap.add_argument('--flatten-only', action='store_true',
-                    help='wyjmij pliki wideo z podfolderów wprost do biblioteki, '
-                         'potem usuń .vsmeta i puste foldery (bez TMDB)')
+    ap.add_argument('--no-cleanup-empty', action='store_true',
+                    help='nie usuwaj .vsmeta ani pustych katalogów')
+    ap.add_argument('--keep-vsmeta', action='store_true', help='zachowaj pliki .vsmeta')
     ap.add_argument('--cache', default=None)
     ap.add_argument('--no-cache', action='store_true')
     ap.add_argument('--log', default=None)
@@ -463,20 +465,19 @@ def main():
     args = ap.parse_args()
 
     cfg = read_config(args.config)
-    for req in ('host', 'user', 'password'):
-        if not cfg.get(req):
-            print(f'Brak "{req}" w {args.config}', file=sys.stderr)
-            sys.exit(1)
 
     root = (args.path or cfg.get('path') or '').rstrip('/')
     if not root:
-        print('Brak ścieżki biblioteki (path).', file=sys.stderr)
+        print('Brak katalogu biblioteki. Podaj --dir /ścieżka (lub path= w config.txt).',
+              file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isdir(root):
+        print(f'Katalog nie istnieje: {root}', file=sys.stderr)
         sys.exit(1)
 
     api_key = args.api_key or os.environ.get('TMDB_API_KEY') or cfg.get('tmdb_api_key')
-    need_tmdb = not (args.cleanup_only or args.dedupe_only or args.flatten_only)
-    if need_tmdb and (not api_key or api_key.startswith('TU_WPISZ')):
-        print('Brak klucza TMDB (--api-key / TMDB_API_KEY / tmdb_api_key w konfiguracji).',
+    if not api_key or api_key.startswith('TU_WPISZ'):
+        print('Brak klucza TMDB (--api-key / TMDB_API_KEY / tmdb_api_key w config.txt).',
               file=sys.stderr)
         sys.exit(1)
 
@@ -486,215 +487,40 @@ def main():
         apply = False
 
     overrides = load_overrides(args.overrides)
-    tmdb = Tmdb(api_key, language) if api_key else None
-    cache_path = None if args.no_cache else (args.cache or cfg.get('cache_path') or 'tmdb_cache_filmy.json')
-    log_path = None if args.no_log else (args.log or cfg.get('log_path') or 'filmy.log')
+    tmdb = Tmdb(api_key, language)
+    cache_path = None if args.no_cache else \
+        (args.cache or cfg.get('cache_path') or os.path.join(SCRIPT_DIR, 'tmdb_cache.json'))
+    log_path = None if args.no_log else \
+        (args.log or cfg.get('log_path') or os.path.join(SCRIPT_DIR, 'jmovies.log'))
 
-    client = connect(cfg)
-
-    code, _o, _e = ssh_run(client, f'test -d {shlex.quote(root)}')
-    if code != 0:
-        print(f'Ścieżka nie istnieje na NAS-ie: {root}', file=sys.stderr)
-        client.close()
-        sys.exit(1)
-
-    # --- tryb: tylko sprzątanie ---
-    if args.cleanup_only:
-        print(f'Biblioteka: {root}\nTryb: TYLKO SPRZĄTANIE')
-        _c, out, _e = ssh_run(client, 'sh -s',
-                              stdin_data='\n'.join(build_cleanup_lines(root, args.keep_vsmeta)) + '\n')
-        if out:
-            print(out, end='')
-        removed = sum(1 for ln in out.split('\n') if ln.startswith('USUNIETO KATALOG:'))
-        vsm = next((ln.split(':', 1)[1].strip()
-                    for ln in out.split('\n') if ln.startswith('USUNIETO VSMETA:')), None)
-        client.close()
-        if vsm is not None:
-            print(f'Usunięto plików .vsmeta: {vsm}')
-        print(f'Usunięto pustych katalogów: {removed}')
-        return
-
-    # --- tryb: usuwanie duplikatów (ten sam film + część) ---
-    if args.dedupe_only:
-        print(f'Biblioteka: {root}')
-        print('Tryb: USUWANIE DUPLIKATÓW '
-              + ('— WYKONANIE' if apply else '— PODGLĄD (dodaj --apply aby skasować)'))
-        _c, out, _e = ssh_run(client, f"find {shlex.quote(root)} -type f -printf '%s\\t%p\\n'")
-        if _c != 0 or not out.strip():
-            _c, out, _e = ssh_run(
-                client, f"find {shlex.quote(root)} -type f -exec stat -c '%s\t%n' -- {{}} +")
-        groups = {}
-        for line in out.split('\n'):
-            if '\t' not in line:
-                continue
-            size_s, path = line.split('\t', 1)
-            base = path.rsplit('/', 1)[-1]
-            if os.path.splitext(base)[1].lower() not in VIDEO_EXT:
-                continue
-            d = path.rsplit('/', 1)[0]
-            _q, _y, part, _r, _e2 = parse_movie(base)
-            try:
-                size = int(size_s)
-            except ValueError:
-                size = 0
-            groups.setdefault((d, part), []).append((size, path))
-        losers = []
-        for (d, part), items in sorted(groups.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))):
-            if len(items) < 2:
-                continue
-            items.sort(key=lambda x: (-x[0], x[1]))
-            keep = items[0]
-            tag = f' część {part}' if part else ''
-            print(f'{d[len(root):].lstrip("/")}{tag}:')
-            print(f'  ZOSTAJE:  {keep[1].rsplit("/", 1)[-1]}  ({keep[0]} B)')
-            for sz, p in items[1:]:
-                print(f'  DUPLIKAT: {p.rsplit("/", 1)[-1]}  ({sz} B)')
-                losers.append(p)
-        if not losers:
-            print('Nie znaleziono duplikatów.')
-            client.close()
-            return
-        if apply:
-            script = '\n'.join(
-                f'rm -f -- {shlex.quote(p)} && printf "USUNIETO: %s\\n" {shlex.quote(p)}'
-                for p in losers) + '\n'
-            _c, o, _e = ssh_run(client, 'sh -s', stdin_data=script)
-            if o:
-                print('---')
-                print(o, end='')
-            n = sum(1 for ln in o.split('\n') if ln.startswith('USUNIETO:'))
-            client.close()
-            print(f'\nUsunięto duplikatów: {n}')
-        else:
-            client.close()
-            print(f'\nDuplikatów do usunięcia: {len(losers)}  (dodaj --apply aby skasować)')
-        return
-
-    # --- tryb: spłaszczenie (wyjmij pliki z podfolderów do biblioteki) ---
-    if args.flatten_only:
-        print(f'Biblioteka: {root}')
-        print('Tryb: SPŁASZCZENIE '
-              + ('— WYKONANIE' if apply else '— PODGLĄD (dodaj --apply aby wykonać)'))
-        _c, out, _e = ssh_run(client, f"find {shlex.quote(root)} -type f -printf '%s\\t%p\\n'")
-        if _c != 0 or not out.strip():
-            _c, out, _e = ssh_run(
-                client, f"find {shlex.quote(root)} -type f -exec stat -c '%s\t%n' -- {{}} +")
-        sizes = {}
-        for line in out.split('\n'):
-            if '\t' in line:
-                s, p = line.split('\t', 1)
-                try:
-                    sizes[p] = int(s)
-                except ValueError:
-                    sizes[p] = 0
-        existing = set(sizes)
-        # pliki wideo leżące w PODFOLDERACH (nie wprost w root)
-        dest_map = {}
-        for p in sizes:
-            if os.path.splitext(p)[1].lower() not in VIDEO_EXT:
-                continue
-            d = p.rsplit('/', 1)[0]
-            if d == root:
-                continue  # już w bibliotece
-            base = p.rsplit('/', 1)[-1]
-            dest_map.setdefault(f'{root}/{base}', []).append((p, sizes.get(p, 0)))
-
-        plan = []
-        to_delete = []
-        for dest, cands in dest_map.items():
-            if dest in existing and all(c[0] != dest for c in cands):
-                cands = cands + [(dest, sizes.get(dest, 0))]
-            seen = {}
-            for p, s in cands:
-                seen[p] = s
-            cands = [(p, seen[p]) for p in seen]
-            cands.sort(key=lambda c: (-c[1], c[0]))
-            keeper = cands[0]
-            if keeper[0] != dest:
-                plan.append((keeper[0], dest))
-            for p, s in cands[1:]:
-                to_delete.append((p, s, dest))
-
-        print(f'Plików do wyjęcia: {len(plan)}, duplikatów: {len(to_delete)}')
-        for src, dest in plan:
-            print(f'{src[len(root):].lstrip("/")}')
-            print(f'   ->  {dest[len(root):].lstrip("/")}')
-        dup_lines = []
-        for p, s, dest in to_delete:
-            verb = 'USUN' if apply else 'DUP '
-            dup_lines.append(f'{verb} {p}  ({human(s)}, {s} B)')
-            dup_lines.append(f'     zostaje: {dest}')
-        for ln in dup_lines:
-            print('  ' + ln)
-
-        moved = removed_dup = 0
-        apply_output = ''
-        if apply:
-            lines = []
-            for p, s, dest in to_delete:
-                q = shlex.quote(p)
-                lines.append(f'rm -f -- {q} && printf "USUNIETO DUP: %s\\n" {q}')
-            for src, dest in plan:
-                qsrc, qdst = shlex.quote(src), shlex.quote(dest)
-                lines.append(
-                    f'if [ -e {qdst} ]; then printf "POMIJAM (istnieje): %s\\n" {qdst}; '
-                    f'else mv -- {qsrc} {qdst} && printf "OK: %s\\n" {qdst}; fi'
-                )
-            if not args.no_cleanup_empty:
-                lines += build_cleanup_lines(root, args.keep_vsmeta)
-            _c, out, err = ssh_run(client, 'sh -s', stdin_data='\n'.join(lines) + '\n')
-            if out:
-                print('---')
-                print(out, end='')
-            if err.strip():
-                print(err, file=sys.stderr, end='')
-            apply_output = out
-            moved = sum(1 for ln in out.split('\n') if ln.startswith('OK:'))
-            removed_dup = sum(1 for ln in out.split('\n') if ln.startswith('USUNIETO DUP:'))
-            vsm = next((ln.split(':', 1)[1].strip()
-                        for ln in out.split('\n') if ln.startswith('USUNIETO VSMETA:')), None)
-            rd = sum(1 for ln in out.split('\n') if ln.startswith('USUNIETO KATALOG:'))
-            if removed_dup:
-                print(f'Usunięto duplikatów: {removed_dup}')
-            if vsm is not None and vsm != '0':
-                print(f'Usunięto plików .vsmeta: {vsm}')
-            if rd:
-                print(f'Usunięto pustych katalogów: {rd}')
-
-        client.close()
-        write_log(log_path, root, apply, plan, moved, removed_dup, apply_output,
-                  dup_lines, [])
-        print('\n==================== PODSUMOWANIE ====================')
-        if apply:
-            print(f'Wyjęto plików: {moved}, usunięto duplikatów: {removed_dup}')
-        else:
-            print(f'Do wyjęcia: {len(plan)}, duplikatów: {len(to_delete)}  '
-                  f'(podgląd — dodaj --apply aby wykonać)')
-        return
-
-    # --- tryb główny: pełna sekwencja (mapowanie -> dedupe -> czyszczenie) ---
-    _c, out, err = ssh_run(client, f"find {shlex.quote(root)} -type f -printf '%s\\t%p\\n'")
-    if _c != 0 or not out.strip():
-        _c, out, err = ssh_run(
-            client, f"find {shlex.quote(root)} -type f -exec stat -c '%s\t%n' -- {{}} +")
-    sizes = {}
-    for line in out.split('\n'):
-        if '\t' not in line:
-            continue
-        s, p = line.split('\t', 1)
-        try:
-            sizes[p] = int(s)
-        except ValueError:
-            sizes[p] = 0
+    sizes = list_files_with_sizes(root)
     existing = set(sizes)
     video_files = [p for p in sizes if os.path.splitext(p)[1].lower() in VIDEO_EXT]
 
-    # grupuj po filmie (folder z [tmdbid] albo tytuł); w grupie trzymamy pliki+części
+    cache = load_cache(cache_path)
+    cache_loaded = len(cache)
+
+    # Grupowanie: tylko pliki BEZ identyfikatora w WŁASNEJ nazwie są kandydatami
+    # do zmiany nazwy. Pliki już otagowane są pomijane i tylko dopisywane do cache.
     groups = {}
+    skipped_tagged = 0
     for full in video_files:
         base = full.rsplit('/', 1)[-1]
-        ancestors = full[len(root):].lstrip('/').split('/')[:-1]
 
+        m_self = RE_TMDBID.search(base)
+        if m_self:
+            # Już ma identyfikator -> nie wymaga edycji; dopisz do cache (bez TMDB).
+            skipped_tagged += 1
+            tid = int(m_self.group(1))
+            ckey = f'id:{tid}'
+            if ckey not in cache:
+                title_part = base[:m_self.start()]
+                cache[ckey] = {'ok': True, 'id': tid,
+                               'name': sanitize_name(clean_query(title_part)) or f'tmdbid-{tid}',
+                               'year': year_from_text(title_part) or ''}
+            continue
+
+        ancestors = full[len(root):].lstrip('/').split('/')[:-1]
         tmdbid_known = None
         for a in ancestors:
             m = RE_TMDBID.search(a)
@@ -716,8 +542,6 @@ def main():
             g['hint_year'] = hint_year
         g['files'].append((full, part, release, ext))
 
-    cache = load_cache(cache_path)
-    cache_loaded = len(cache)
     unresolved = []
     dest_map = {}   # dest -> [(path, size), ...] kandydaci do tej samej nazwy
 
@@ -774,6 +598,7 @@ def main():
         print(f'Cache TMDB: {cache_path} (wczytano: {cache_loaded}, zapisano: {ok_now})')
     if log_path:
         print(f'Log: {log_path}')
+    print(f'Pominięto (mają już identyfikator): {skipped_tagged}')
     print(f'Plików do zmiany nazwy/przeniesienia: {len(plan)}')
     print(f'Duplikatów {"do usunięcia" if not apply else "usuwanych"}: {len(to_delete)}')
     print('---')
@@ -782,47 +607,45 @@ def main():
         print('   ->  ' + dest[len(root):].lstrip('/'))
 
     moved = removed_dup = 0
-    apply_output = ''
+    apply_lines = []
     if apply:
-        lines = []
         # 1) usuń duplikaty (zostaje największy) — PRZED przenoszeniem, by zwolnić nazwę
         for p, s, dest in to_delete:
-            q = shlex.quote(p)
-            lines.append(f'rm -f -- {q} && printf "USUNIETO DUP: %s\\n" {q}')
+            try:
+                os.remove(p)
+                removed_dup += 1
+                apply_lines.append(f'USUNIETO DUP: {p}')
+            except OSError as exc:
+                apply_lines.append(f'BŁĄD (usuwanie): {p} ({exc})')
         # 2) mapowanie: przenieś/zmień nazwę
         for src, dest in plan:
-            qsrc, qdst, qdir = shlex.quote(src), shlex.quote(dest), shlex.quote(dest.rsplit('/', 1)[0])
-            lines.append(
-                f'mkdir -p {qdir}; '
-                f'if [ -e {qdst} ]; then printf "POMIJAM (istnieje): %s\\n" {qdst}; '
-                f'else mv -- {qsrc} {qdst} && printf "OK: %s\\n" {qdst}; fi'
-            )
+            if os.path.exists(dest):
+                apply_lines.append(f'POMIJAM (istnieje): {dest}')
+                continue
+            try:
+                move_file(src, dest)
+                moved += 1
+                apply_lines.append(f'OK: {dest}')
+            except OSError as exc:
+                apply_lines.append(f'BŁĄD (przenoszenie): {src} ({exc})')
         # 3) czyszczenie: .vsmeta + puste katalogi
+        vsm = rd = 0
         if not args.no_cleanup_empty:
-            lines += build_cleanup_lines(root, args.keep_vsmeta)
-        if lines:
-            _c, out, err = ssh_run(client, 'sh -s', stdin_data='\n'.join(lines) + '\n')
-            if out:
-                print('---')
-                print(out, end='')
-            if err.strip():
-                print(err, file=sys.stderr, end='')
-            apply_output = out
-            moved = sum(1 for ln in out.split('\n') if ln.startswith('OK:'))
-            removed_dup = sum(1 for ln in out.split('\n') if ln.startswith('USUNIETO DUP:'))
-            vsm = next((ln.split(':', 1)[1].strip()
-                        for ln in out.split('\n') if ln.startswith('USUNIETO VSMETA:')), None)
-            rd = sum(1 for ln in out.split('\n') if ln.startswith('USUNIETO KATALOG:'))
-            if removed_dup:
-                print(f'Usunięto duplikatów: {removed_dup}')
-            if vsm is not None and vsm != '0':
-                print(f'Usunięto plików .vsmeta: {vsm}')
-            if rd:
-                print(f'Usunięto pustych katalogów: {rd}')
+            if not args.keep_vsmeta:
+                vsm = remove_vsmeta(root)
+            rd = remove_empty_dirs(root, args.keep_vsmeta)
 
-    client.close()
-    write_log(log_path, root, apply, plan, moved, removed_dup, apply_output,
-              dup_lines, unresolved)
+        for ln in apply_lines:
+            print(ln)
+        if removed_dup:
+            print(f'Usunięto duplikatów: {removed_dup}')
+        if vsm:
+            print(f'Usunięto plików .vsmeta: {vsm}')
+        if rd:
+            print(f'Usunięto pustych katalogów: {rd}')
+
+    write_log(log_path, root, apply, plan, moved, removed_dup,
+              '\n'.join(apply_lines), dup_lines, unresolved)
 
     print('\n==================== PODSUMOWANIE ====================')
     if apply:
@@ -843,7 +666,7 @@ def main():
             print(f'  "{query}"  — {reason}{hint_s}  ({nfiles} plik(ów))')
             for c in cands:
                 print(f'      kandydat: {c["name"]} ({c["year"]})  tmdbid-{c["id"]}')
-        print('\n  Aby wymusić dopasowanie, dopisz do tmdb_overrides_filmy.txt, np.:')
+        print('\n  Aby wymusić dopasowanie, dopisz do tmdb_overrides.txt, np.:')
         print('      Nazwa filmu = 12345')
 
 
